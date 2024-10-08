@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024 Comcast Cable Communications Management, LLC
+// SPDX-License-Identifier: Apache-2.0
+
 package rbus
 
 import (
@@ -5,28 +8,56 @@ import (
 	"rbus/internal/rtmessage"
 )
 
-type Handle struct {
-	Connection *rtmessage.Connection
+// config holds the configuration for the rbus connection
+type config struct {
+	url     string
+	appName string
+	id      int
 }
 
-func Open() (*Handle, error) {
-	con, err := rtmessage.NewConnection(rtmessage.Config{
-		URL:             "unix:///tmp/rtrouted",
-		ApplicationName: "go_client",
-	})
+// Assure that optionFunc implements the Options interface.
+var _ Option = optionFunc(nil)
 
+type Handle struct {
+	cfg  config
+	conn *rtmessage.Connection
+}
+
+// New creates a new rbus handle or returns an error.
+func New(opts ...Option) (*Handle, error) {
+	var h Handle
+
+	required := []Option{
+		assertApplicationName(),
+		assertURL(),
+	}
+
+	opts = append(opts, required...)
+
+	for _, opt := range opts {
+		err := opt.apply(&h.cfg)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &h, nil
+}
+
+// Open creates a new rbus connection or returns an error.
+func (h *Handle) Open() error {
+	con, err := rtmessage.New(h.cfg.url)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	err = con.Connect()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return &Handle{
-		Connection: con,
-	}, nil
+	h.conn = con
+	return nil
 }
 
 func (h *Handle) Get(name string) (*Value, error) {
@@ -38,8 +69,8 @@ func (h *Handle) Set(name string, value *Value) error {
 }
 
 func (h *Handle) Close() {
-	if h.Connection != nil {
-		h.Connection.Disconnect()
-		h.Connection = nil
+	if h.conn != nil {
+		h.conn.Disconnect()
+		h.conn = nil
 	}
 }

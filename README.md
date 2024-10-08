@@ -19,7 +19,7 @@ objects with properties, events, and methods.
 #### Build rbus and dependencies 
 
     git clone https://github.com/rdkcentral/rbus
-    cmake -Hrbus -Bbuild/rbus -DCMAKE_INSTALL_PREFIX=${RBUS_INSTALL_DIR}/usr -DBUILD_FOR_DESKTOP=ON -DCMAKE_BUILD_TYPE=Debug
+    cmake -Bbuild/rbus -DBUILD_FOR_DESKTOP=ON -DCMAKE_BUILD_TYPE=Debug -DCMAKE_INSTALL_PREFIX=build/install
     make -C build/rbus && make -C build/rbus install
 
 ## Run Rbus Apps

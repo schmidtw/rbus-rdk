@@ -6,19 +6,27 @@ import (
 )
 
 func main() {
-	rbusHandle, err := rbus.Open()
+	h, err := rbus.New(
+		rbus.WithURL("unix://file/default"),
+		rbus.WithApplicationName("foo"),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	err = h.Open()
 	if err != nil {
 		panic(fmt.Sprintf("Failed to open rbus: %v", err))
 	}
-	defer rbusHandle.Close()
+	defer h.Close()
 
-	value1, err := rbusHandle.Get("Device.Foo")
+	value1, err := h.Get("Device.Foo")
 	if err != nil {
 		panic(fmt.Sprintf("Failed to get value: %v", err))
 	}
 
 	value2 := rbus.NewValue[uint64](42)
-	rbusHandle.Set("Device.Foo", &value2)
+	h.Set("Device.Foo", &value2)
 
 	fmt.Printf("Value: %s\n", value1)
 }

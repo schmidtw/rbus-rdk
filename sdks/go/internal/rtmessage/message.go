@@ -37,7 +37,7 @@ type Message struct {
 	Times      [5]uint32
 }
 
-func (m Message) Encode() ([]byte, error) {
+func (m Message) encode() ([]byte, error) {
 	if len(m.Payload) > math.MaxUint32 {
 		return nil, fmt.Errorf("%w: payload too large", ErrInvalidMsg)
 	}
@@ -84,19 +84,16 @@ func (m Message) Encode() ([]byte, error) {
 	return buf, nil
 }
 
-func Decode(buf []byte) (m *Message, err error) {
+func decode(buf []byte) (m Message, err error) {
 	// Since error should be few and far between so catching seem like a good approach.
 	defer func() {
 		if recover() != nil {
-			m = nil
 			err = fmt.Errorf("%w: buffer too small", ErrInvalidMsg)
 		}
 	}()
 
-	m = new(Message)
-
 	if header_MARKER != binary.BigEndian.Uint16(buf) {
-		return nil, fmt.Errorf("%w: invalid leading marker", ErrInvalidMsg)
+		return Message{}, fmt.Errorf("%w: invalid leading marker", ErrInvalidMsg)
 	}
 	headerLen := binary.BigEndian.Uint16(buf[2:3])
 
@@ -104,7 +101,7 @@ func Decode(buf []byte) (m *Message, err error) {
 	m.Payload = buf[headerLen:]
 
 	if header_MARKER != binary.BigEndian.Uint16(header[len(header)-2:]) {
-		return nil, fmt.Errorf("%w: invalid trailing marker", ErrInvalidMsg)
+		return Message{}, fmt.Errorf("%w: invalid trailing marker", ErrInvalidMsg)
 	}
 	header = header[:len(header)-2]
 
@@ -120,7 +117,7 @@ func Decode(buf []byte) (m *Message, err error) {
 	payloadLen := binary.BigEndian.Uint32(header)
 	header = header[4:]
 	if payloadLen != uint32(len(m.Payload)) {
-		return nil, fmt.Errorf("%w: invalid payload lenght", ErrInvalidMsg)
+		return Message{}, fmt.Errorf("%w: invalid payload lenght", ErrInvalidMsg)
 	}
 
 	topicLen := binary.BigEndian.Uint32(header)
@@ -146,5 +143,26 @@ func Decode(buf []byte) (m *Message, err error) {
 		return m, nil
 	}
 
-	return nil, fmt.Errorf("%w: unknown protocol version", ErrInvalidMsg)
+	return Message{}, fmt.Errorf("%w: unknown protocol version", ErrInvalidMsg)
 }
+
+// MessageListener provides a simple way to get notified when a new Message
+// is read from the bus.
+type MessageListener interface {
+	OnMessage(Message)
+}
+
+// MessageListenerFunc is a function that implements the MessageListener
+// interface.  It is useful for creating a listener from a function.
+type MessageListenerFunc func(Message)
+
+func (f MessageListenerFunc) OnMessage(m Message) {
+	f(m)
+}
+
+// CancelListenerFunc removes the listener it's associated with and cancels any
+// future events sent to that listener.
+//
+// A CancelListenerFunc is idempotent:  after the first invocation, calling this
+// closure will have no effect.
+type CancelListenerFunc func()

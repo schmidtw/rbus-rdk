@@ -3,12 +3,14 @@
 package rtmessage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"strings"
+	"net/url"
 	"sync"
+
+	"github.com/xmidt-org/eventor"
 )
 
 var (
@@ -16,38 +18,40 @@ var (
 	ErrInvalidInput = errors.New("invalid input")
 )
 
-type Config struct {
-	URL             string
-	ApplicationName string
-}
-
 type Connection struct {
-	network string
-	address string
-	con     net.Conn
-	m       sync.Mutex
+	url       *url.URL
+	con       net.Conn
+	m         sync.Mutex
+	listeners eventor.Eventor[MessageListener]
 }
 
+// I don't think this belongs in here since it doesn't seem to be related
+// to the rtmessage code directly.
+/*
 func createInboxName(appName string) string {
 	return fmt.Sprintf("%s.INBOX.%d", appName, os.Getpid())
 }
+*/
 
-func NewConnection(c Config) (*Connection, error) {
-	parts := strings.Split(c.URL, "://")
-	switch parts[0] {
-	case "unix":
-		parts[1] = "/" + parts[1]
-	case "tcp":
+// New creates a new connection or returns an error.
+func New(rawURL string) (*Connection, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	switch u.Scheme {
+	case "unix", "tcp":
 	default:
-		return nil, ErrInvalidInput
+		return nil, fmt.Errorf("%w: unsupported URL scheme", ErrInvalidInput)
 	}
 
 	return &Connection{
-		network: parts[0],
-		address: parts[1],
+		url: u,
 	}, nil
 }
 
+// Connect establishes a connection to the server.
 func (c *Connection) Connect() error {
 	c.m.Lock()
 	defer c.m.Unlock()
@@ -56,25 +60,49 @@ func (c *Connection) Connect() error {
 		return nil
 	}
 
-	con, err := net.Dial(c.network, c.address)
+	var con net.Conn
+	var err error
+
+	switch c.url.Scheme {
+	case "unix":
+		con, err = net.Dial(c.url.Scheme, c.url.Path)
+	case "tcp":
+		con, err = net.Dial(c.url.Scheme, c.url.Host)
+	}
+
 	if err != nil {
 		return err
 	}
 
 	c.con = con
+
+	go c.readLoop()
+
 	return nil
 }
 
+// Disconnect closes the connection to the server.
 func (c *Connection) Disconnect() error {
 	c.m.Lock()
 	defer c.m.Unlock()
+
+	if c.con == nil {
+		return nil
+	}
 
 	err := c.con.Close()
 	c.con = nil
 	return err
 }
 
-func (c *Connection) Send(m *Message) error {
+// Send sends a message to the server.  If the context is canceled, the function
+// will return immediately with the context error.
+func (c *Connection) Send(ctx context.Context, m *Message) error {
+	buf, err := m.encode()
+	if err != nil {
+		return err
+	}
+
 	c.m.Lock()
 	defer c.m.Unlock()
 
@@ -82,39 +110,62 @@ func (c *Connection) Send(m *Message) error {
 		return ErrInvalidState
 	}
 
-	buf, err := m.Encode()
-	if err != nil {
-		return err
-	}
+	total := len(buf)
+	sent := 0
 
-	n, err := c.con.Write(buf)
-	if err != nil {
-		return err
-	}
-
-	if n < len(buf) {
-		return errors.New("not all bytes were sent")
+	for sent < total {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			n, err := c.con.Write(buf[sent:])
+			if err != nil {
+				return err
+			}
+			sent += n
+		}
 	}
 
 	return nil
 }
 
-func (c *Connection) Read() (*Message, error) {
-	c.m.Lock()
-	defer c.m.Unlock()
+// Add adds an event listener to the message listener.
+// The listener will be called for each event that occurs.  The returned
+// function can be called to remove the listener.
+func (c *Connection) Add(listener MessageListener) CancelListenerFunc {
+	return CancelListenerFunc(c.listeners.Add(listener))
+}
 
-	if c.con == nil {
-		return nil, ErrInvalidState
-	}
-
+// readLoop reads messages from the server and sends events to registered listeners.
+func (c *Connection) readLoop() {
 	buf := make([]byte, 4096)
 
-	n, err := c.con.Read(buf)
-	if err != nil {
-		return nil, err
+	for {
+		c.m.Lock()
+		if c.con == nil {
+			c.m.Unlock()
+			return
+		}
+		c.m.Unlock()
+
+		_, err := c.con.Read(buf)
+		if err != nil {
+			if err == net.ErrClosed {
+				return
+			}
+			// TODO this probably needs to be better.
+			continue
+		}
+
+		msg, err := decode(buf)
+		if err != nil {
+			// TODO this probably needs to be better.
+			continue
+		}
+
+		// Send the event to registered listeners
+		c.listeners.Visit(func(listener MessageListener) {
+			listener.OnMessage(msg)
+		})
 	}
-
-	buf = buf[0:n]
-
-	return Decode(buf)
 }
