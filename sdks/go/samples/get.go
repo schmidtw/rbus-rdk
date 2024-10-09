@@ -2,31 +2,29 @@ package main
 
 import (
 	"fmt"
-	"rbus"
+	"rbus/internal/rtmessage"
+	"time"
 )
 
 func main() {
-	h, err := rbus.New(
-		rbus.WithURL("unix://file/default"),
-		rbus.WithApplicationName("foo"),
-	)
+	url := "unix:///tmp/rtrouted"
+	appName := "my_go_app"
+
+	con, err := rtmessage.NewConnection(url, appName)
 	if err != nil {
-		panic(err)
+		panic(fmt.Sprintf("Failed to create connection. %s", err.Error()))
 	}
 
-	err = h.Open()
-	if err != nil {
-		panic(fmt.Sprintf("Failed to open rbus: %v", err))
-	}
-	defer h.Close()
-
-	value1, err := h.Get("Device.Foo")
-	if err != nil {
-		panic(fmt.Sprintf("Failed to get value: %v", err))
+	if err := con.Connect(); err != nil {
+		panic(fmt.Sprintf("Failed to connect. %s", err.Error()))
 	}
 
-	value2 := rbus.NewValue[uint64](42)
-	h.Set("Device.Foo", &value2)
+	con.Add(rtmessage.MessageListenerFunc(func(msg rtmessage.Message) {
+		fmt.Printf("Received message: %s\n", string(msg.Payload))
+	}), "A.B.C")
 
-	fmt.Printf("Value: %s\n", value1)
+	// This is somewhat weird.
+	for {
+		time.Sleep(1 * time.Second)
+	}
 }
