@@ -1,4 +1,4 @@
-module rbus
+module github.com/schmidtw/rbus-rdk/sdks/go/rbus
 
 go 1.22.0
 

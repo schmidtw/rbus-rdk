@@ -37,6 +37,7 @@ func WithApplicationName(name string) Option {
 	})
 }
 
+// WithInboxID sets the inbox ID for the rbus connection to the specified value.
 func WithInboxID(id int) Option {
 	return optionFunc(func(cfg *config) error {
 		cfg.id = id
@@ -44,6 +45,8 @@ func WithInboxID(id int) Option {
 	})
 }
 
+// WithInboxAsPID sets the inbox ID for the rbus connection to the current process ID.
+// This is the default behavior.
 func WithInboxAsPID() Option {
 	return WithInboxID(os.Getpid())
 }

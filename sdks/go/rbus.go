@@ -5,7 +5,8 @@ package rbus
 
 import (
 	"errors"
-	"rbus/internal/rtmessage"
+
+	"github.com/schmidtw/rbus-rdk/sdks/go/rbus/rtmessage"
 )
 
 // config holds the configuration for the rbus connection
@@ -32,6 +33,11 @@ func New(opts ...Option) (*Handle, error) {
 		assertURL(),
 	}
 
+	defaults := []Option{
+		WithInboxAsPID(),
+	}
+
+	opts = append(defaults, opts...)
 	opts = append(opts, required...)
 
 	for _, opt := range opts {
@@ -46,7 +52,7 @@ func New(opts ...Option) (*Handle, error) {
 
 // Open creates a new rbus connection or returns an error.
 func (h *Handle) Open() error {
-	con, err := rtmessage.New(h.cfg.url)
+	con, err := rtmessage.New(h.cfg.url, h.cfg.appName)
 	if err != nil {
 		return err
 	}
@@ -68,9 +74,12 @@ func (h *Handle) Set(name string, value *Value) error {
 	return errors.New("not implemented")
 }
 
-func (h *Handle) Close() {
+func (h *Handle) Close() error {
+	var err error
 	if h.conn != nil {
-		h.conn.Disconnect()
+		err = h.conn.Disconnect()
 		h.conn = nil
 	}
+
+	return err
 }

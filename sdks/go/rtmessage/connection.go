@@ -39,6 +39,7 @@ const (
 type Connection struct {
 	url       *url.URL
 	con       net.Conn
+	cancel    context.CancelFunc
 	m         sync.Mutex
 	appName   string
 	generator SubscriptionIDGenerator
@@ -53,7 +54,7 @@ type subscriptionRequest struct {
 }
 
 // New creates a new connection or returns an error.
-func NewConnection(rawURL string, appName string) (*Connection, error) {
+func New(rawURL string, appName string) (*Connection, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
@@ -75,9 +76,9 @@ func NewConnection(rawURL string, appName string) (*Connection, error) {
 // Connect establishes a connection to the server.
 func (c *Connection) Connect() error {
 	c.m.Lock()
+	defer c.m.Unlock()
 
 	if c.con != nil {
-		c.m.Unlock()
 		return nil
 	}
 
@@ -92,18 +93,18 @@ func (c *Connection) Connect() error {
 	}
 
 	if err != nil {
-		c.m.Unlock()
 		return err
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	c.con = con
-	c.m.Unlock()
+	c.cancel = cancel
 
 	// TODO: check if this is needed
 	// inboxName := fmt.Sprintf("%s.INBOX.%d", c.appName, os.Getpid())
 	// c.AddListener(inboxName)
 
-	go c.readLoop()
+	go c.readLoop(ctx)
 
 	return nil
 }
@@ -117,8 +118,11 @@ func (c *Connection) Disconnect() error {
 		return nil
 	}
 
+	c.cancel()
 	err := c.con.Close()
 	c.con = nil
+	c.cancel = nil
+
 	return err
 }
 
@@ -238,59 +242,64 @@ func (c *Connection) readUntil(ctx context.Context, buf []byte) error {
 }
 
 // readLoop reads messages from the server and sends events to registered listeners.
-func (c *Connection) readLoop() {
+func (c *Connection) readLoop(ctx context.Context) {
 	var header *Header
 
 	const headerPreambleLength = uint16(6)
 
 	for {
-		switch c.state {
-		case ReadStateReadHeaderPreamble:
-			header = &Header{}
-			buff := make([]byte, headerPreambleLength)
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			switch c.state {
+			case ReadStateReadHeaderPreamble:
+				header = &Header{}
+				buff := make([]byte, headerPreambleLength)
 
-			if err := c.readUntil(context.Background(), buff); err != nil {
-				// TODO: this won't work
-				panic(fmt.Sprintf("Failed to read header preamble: %v", err))
-			}
+				if err := c.readUntil(ctx, buff); err != nil {
+					fmt.Printf("Failed to read header preamble: %v\n", err)
+					return
+				}
 
-			if err := header.decodePreamble(buff); err != nil {
-				// TODO: this won't work
-				panic(fmt.Sprintf("Failed to decode header preamble: %v", err))
-			}
+				if err := header.decodePreamble(buff); err != nil {
+					fmt.Printf("Failed to decode header preamble: %v\n", err)
+					return
+				}
 
-			c.state = ReadStateReadHeader
+				c.state = ReadStateReadHeader
 
-		case ReadStateReadHeader:
-			buff := make([]byte, header.HeaderLength-headerPreambleLength)
+			case ReadStateReadHeader:
+				buff := make([]byte, header.HeaderLength-headerPreambleLength)
 
-			if err := c.readUntil(context.Background(), buff); err != nil {
-				// TODO: this won't work
-				panic(fmt.Sprintf("Failed to read header: %v", err))
-			}
+				if err := c.readUntil(ctx, buff); err != nil {
+					fmt.Printf("Failed to read header: %v\n", err)
+					return
+				}
 
-			if err := header.decodePostPreamble(buff); err != nil {
-				// TODO: this won't work
-				panic(fmt.Sprintf("Failed to decode header: %v", err))
-			}
+				if err := header.decodePostPreamble(buff); err != nil {
+					fmt.Printf("Failed to decode header: %v\n", err)
+					return
+				}
 
-			c.state = ReadStateReadPayload
+				c.state = ReadStateReadPayload
 
-		case ReadStateReadPayload:
-			buff := make([]byte, header.PayloadLength)
-			if err := c.readUntil(context.Background(), buff); err != nil {
-				// TODO: this won't work
-				panic(fmt.Sprintf("Failed to read payload: %v", err))
-			}
+			case ReadStateReadPayload:
+				buff := make([]byte, header.PayloadLength)
+				if err := c.readUntil(ctx, buff); err != nil {
+					fmt.Printf("Failed to read payload: %v\n", err)
+					return
+				}
 
-			c.listeners.Visit(func(listener MessageListener) {
-				listener.OnMessage(Message{
-					Header:  header,
-					Payload: buff,
+				c.listeners.Visit(func(listener MessageListener) {
+					listener.OnMessage(Message{
+						Header:  header,
+						Payload: buff,
+					})
 				})
-			})
 
-			c.state = ReadStateReadHeaderPreamble
+				c.state = ReadStateReadHeaderPreamble
+			}
 		}
 	}
 }

@@ -2,15 +2,20 @@ package main
 
 import (
 	"fmt"
-	"rbus/internal/rtmessage"
 	"time"
+
+	"github.com/schmidtw/rbus-rdk/sdks/go/rbus/rtmessage"
+)
+
+const (
+	tcpURL  = "tcp://127.0.0.1:10001"
+	unixURL = "unix:///tmp/rtrouted"
 )
 
 func main() {
-	url := "unix:///tmp/rtrouted"
 	appName := "my_go_app"
 
-	con, err := rtmessage.NewConnection(url, appName)
+	con, err := rtmessage.New(tcpURL, appName)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create connection. %s", err.Error()))
 	}
@@ -23,8 +28,6 @@ func main() {
 		fmt.Printf("Received message: %s\n", string(msg.Payload))
 	}), "A.B.C")
 
-	// This is somewhat weird.
-	for {
-		time.Sleep(1 * time.Second)
-	}
+	// Only run for a minute, then exit.
+	time.Sleep(1 * time.Minute)
 }
