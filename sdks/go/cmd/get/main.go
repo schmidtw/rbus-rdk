@@ -1,30 +1,35 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"github.com/schmidtw/rbus-rdk/sdks/go/rbus/internal/rtmessage"
+	"github.com/schmidtw/rbus-rdk/sdks/go/rbus"
+)
+
+const (
+	tcpURL  = "tcp://127.0.0.1:10001"
+	unixURL = "unix:///tmp/rtrouted"
 )
 
 func main() {
-	url := "unix:///tmp/rtrouted"
-	appName := "my_go_app"
-
-	con, err := rtmessage.New(url, appName)
+	h, err := rbus.New(rbus.WithURL(unixURL), rbus.WithApplicationName("go_app"))
 	if err != nil {
-		panic(fmt.Sprintf("Failed to create connection. %s", err.Error()))
+		panic(fmt.Sprintf("Failed to create rbus handle. %s", err.Error()))
 	}
 
-	if err := con.Connect(); err != nil {
-		panic(fmt.Sprintf("Failed to connect. %s", err.Error()))
+	if err := h.Open(); err != nil {
+		panic(fmt.Sprintf("Failed to open rbus connection. %s", err.Error()))
 	}
 
-	con.Add(rtmessage.MessageListenerFunc(func(msg rtmessage.Message) {
-		fmt.Printf("Received message: %s\n", string(msg.Payload))
-	}), "A.B.C")
+	v, err := h.Get(context.Background(), "Device.SampleProvider.AllTypes.Int16Data")
+	if err != nil {
+		panic(fmt.Sprintf("Failed to get value. %s", err.Error()))
+	}
 
-	// This is somewhat weird.
+	fmt.Printf("Value: %v\n", v)
+
 	for {
 		time.Sleep(1 * time.Second)
 	}

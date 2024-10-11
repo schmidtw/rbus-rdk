@@ -1,10 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
-	"github.com/schmidtw/rbus-rdk/sdks/go/rbus/rtmessage"
+	"github.com/schmidtw/rbus-rdk/sdks/go/rbus"
 )
 
 const (
@@ -13,21 +14,19 @@ const (
 )
 
 func main() {
-	appName := "my_go_app"
-
-	con, err := rtmessage.New(tcpURL, appName)
+	h, err := rbus.New(rbus.WithURL(tcpURL), rbus.WithApplicationName("go_app"))
 	if err != nil {
-		panic(fmt.Sprintf("Failed to create connection. %s", err.Error()))
+		panic(fmt.Sprintf("Failed to create rbus handle. %s", err.Error()))
 	}
 
-	if err := con.Connect(); err != nil {
-		panic(fmt.Sprintf("Failed to connect. %s", err.Error()))
+	v, err := h.Get(context.Background(), "Device.SampleProvider.AllTypes.Int16Data")
+	if err != nil {
+		panic(fmt.Sprintf("Failed to get value. %s", err.Error()))
 	}
 
-	con.Add(rtmessage.MessageListenerFunc(func(msg rtmessage.Message) {
-		fmt.Printf("Received message: %s\n", string(msg.Payload))
-	}), "A.B.C")
+	fmt.Printf("Value: %v\n", v)
 
-	// Only run for a minute, then exit.
-	time.Sleep(1 * time.Minute)
+	for {
+		time.Sleep(1 * time.Second)
+	}
 }

@@ -9,10 +9,9 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
-
-	"github.com/xmidt-org/eventor"
 )
 
 var (
@@ -36,15 +35,18 @@ const (
 	ReadStateReadPayload
 )
 
+type MessageCallback func(*Header, []byte)
+
 type Connection struct {
-	url       *url.URL
-	con       net.Conn
-	cancel    context.CancelFunc
-	m         sync.Mutex
-	appName   string
-	generator SubscriptionIDGenerator
-	state     ReadState
-	listeners eventor.Eventor[MessageListener]
+	url             *url.URL
+	con             net.Conn
+	cancel          context.CancelFunc
+	m               sync.Mutex
+	appName         string
+	inboxName       string
+	generator       SubscriptionIDGenerator
+	state           ReadState
+	messageHandlers map[int]MessageCallback
 }
 
 type subscriptionRequest struct {
@@ -67,14 +69,16 @@ func New(rawURL string, appName string) (*Connection, error) {
 	}
 
 	return &Connection{
-		url:     u,
-		appName: appName,
-		state:   ReadStateReadHeaderPreamble,
+		url:             u,
+		appName:         appName,
+		state:           ReadStateReadHeaderPreamble,
+		inboxName:       fmt.Sprintf("%s.INBOX.%d", appName, os.Getpid()),
+		messageHandlers: make(map[int]MessageCallback),
 	}, nil
 }
 
 // Connect establishes a connection to the server.
-func (c *Connection) Connect() error {
+func (c *Connection) Connect(inboxHandler MessageCallback) error {
 	c.m.Lock()
 	defer c.m.Unlock()
 
@@ -100,11 +104,32 @@ func (c *Connection) Connect() error {
 	c.con = con
 	c.cancel = cancel
 
-	// TODO: check if this is needed
-	// inboxName := fmt.Sprintf("%s.INBOX.%d", c.appName, os.Getpid())
-	// c.AddListener(inboxName)
+	if inboxHandler != nil {
+		c.AddListener(ctx, c.inboxName, inboxHandler)
+	}
 
 	go c.readLoop(ctx)
+
+	return nil
+}
+
+func (c *Connection) AddListener(ctx context.Context, expression string, callback MessageCallback) error {
+	req := subscriptionRequest{
+		Topic:   c.inboxName,
+		Add:     1,
+		RouteID: c.generator.getNextSubscriptionID(),
+	}
+
+	jsonData, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+
+	if err := c.Send(ctx, jsonData, "_RTROUTED.INBOX.SUBSCRIBE"); err != nil {
+		return err
+	}
+
+	c.messageHandlers[req.RouteID] = callback
 
 	return nil
 }
@@ -124,26 +149,6 @@ func (c *Connection) Disconnect() error {
 	c.cancel = nil
 
 	return err
-}
-
-func (c *Connection) Add(listener MessageListener, expression string) (CancelListenerFunc, error) {
-	req := subscriptionRequest{
-		Topic:   expression,
-		Add:     1,
-		RouteID: c.generator.getNextSubscriptionID(),
-	}
-
-	jsonData, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := c.Send(context.Background(), jsonData, "_RTROUTED.INBOX.SUBSCRIBE"); err != nil {
-		return nil, err
-	}
-
-	// TODO: you need to associate this listener with the req.RouteID
-	return CancelListenerFunc(c.listeners.Add(listener)), nil
 }
 
 func sendAll(ctx context.Context, conn net.Conn, buff []byte) error {
@@ -166,9 +171,9 @@ func sendAll(ctx context.Context, conn net.Conn, buff []byte) error {
 	return nil
 }
 
-func (c *Connection) makeEncodedHeader(payload []byte, topic string, replyTopic string) ([]byte, error) {
+func (c *Connection) makeEncodedHeader(payload []byte, topic string, replyTopic string, isRequest bool) ([]byte, error) {
 	topicLength := len(topic)
-	replyTopicLength := 0
+	replyTopicLength := len(replyTopic)
 	sizeWithoutStringsInBytes := 32
 	sizeWithoutStringsInBytes += 20 // 4 time_t fields
 
@@ -183,6 +188,10 @@ func (c *Connection) makeEncodedHeader(payload []byte, topic string, replyTopic 
 		ReplyTopic:     replyTopic,
 	}
 
+	if isRequest {
+		header.Flags |= 0x01
+	}
+
 	encodedHeader, err := header.encode()
 	if err != nil {
 		return nil, err
@@ -194,7 +203,16 @@ func (c *Connection) makeEncodedHeader(payload []byte, topic string, replyTopic 
 // Send sends a message to the server.  If the context is canceled, the function
 // will return immediately with the context error.
 func (c *Connection) Send(ctx context.Context, payload []byte, topic string) error {
-	encodedHeader, err := c.makeEncodedHeader(payload, topic, "")
+	encodedHeader, err := c.makeEncodedHeader(payload, topic, "", false)
+	if err != nil {
+		return err
+	}
+
+	return c.sendWithHeader(ctx, encodedHeader, payload)
+}
+
+func (c *Connection) SendRequest(ctx context.Context, payload []byte, topic string) error {
+	encodedHeader, err := c.makeEncodedHeader(payload, topic, c.inboxName, true)
 	if err != nil {
 		return err
 	}
@@ -203,9 +221,6 @@ func (c *Connection) Send(ctx context.Context, payload []byte, topic string) err
 }
 
 func (c *Connection) sendWithHeader(ctx context.Context, header []byte, payload []byte) error {
-	c.m.Lock()
-	defer c.m.Unlock()
-
 	if c.con == nil {
 		return ErrInvalidState
 	}
@@ -291,12 +306,9 @@ func (c *Connection) readLoop(ctx context.Context) {
 					return
 				}
 
-				c.listeners.Visit(func(listener MessageListener) {
-					listener.OnMessage(Message{
-						Header:  header,
-						Payload: buff,
-					})
-				})
+				if handler, ok := c.messageHandlers[int(header.ControlData)]; ok {
+					handler(header, buff)
+				}
 
 				c.state = ReadStateReadHeaderPreamble
 			}
