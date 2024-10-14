@@ -1,11 +1,13 @@
+// SPDX-FileCopyrightText: 2024 Comcast Cable Communications Management, LLC
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
-	"context"
 	"fmt"
 	"time"
 
-	"github.com/schmidtw/rbus-rdk/sdks/go/rbus"
+	"github.com/schmidtw/rbus-rdk/sdks/go/rbus/rtmessage"
 )
 
 const (
@@ -14,17 +16,32 @@ const (
 )
 
 func main() {
-	h, err := rbus.New(rbus.WithURL(tcpURL), rbus.WithApplicationName("go_app"))
+	appName := "my_go_app"
+
+	con, err := rtmessage.New(tcpURL, appName, 123,
+		rtmessage.WithReadTimeout(5*time.Second),
+		rtmessage.WithWriteTimeout(5*time.Second),
+		rtmessage.WithErrorListener(rtmessage.ReadErrorListenerFunc(func(err error) {
+			fmt.Printf("Read error: %s\n", err.Error())
+		})),
+		rtmessage.WithMessageListener(rtmessage.MessageListenerFunc(func(msg rtmessage.Message) {
+			fmt.Printf("Received message: %s\n", string(msg.Payload))
+		})),
+		rtmessage.WithSubscription("A.B.C"),
+	)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create rbus handle. %s", err.Error()))
 	}
 
-	v, err := h.Get(context.Background(), "Device.SampleProvider.AllTypes.Int16Data")
-	if err != nil {
-		panic(fmt.Sprintf("Failed to get value. %s", err.Error()))
+	fmt.Println("Object created.")
+
+	if err := con.Connect(); err != nil {
+		panic(fmt.Sprintf("Failed to connect. %s", err.Error()))
 	}
 
-	fmt.Printf("Value: %v\n", v)
+	fmt.Println("Connected.")
+
+	fmt.Println("Listening for messages.")
 
 	for {
 		time.Sleep(1 * time.Second)

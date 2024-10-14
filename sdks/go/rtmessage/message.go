@@ -1,246 +1,265 @@
-// SPDX-FileCopyrightText: 2023 Comcast Cable Communications Management, LLC
+// SPDX-FileCopyrightText: 2024 Comcast Cable Communications Management, LLC
 // SPDX-License-Identifier: Apache-2.0
+
 package rtmessage
 
 import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"time"
 )
 
 const (
-	FLAGS_REQUEST = 1 << iota
-	FLAGS_RESPONSE
-	FLAGS_UNDELIVERABLE
-	FLAGS_TAINTED
-	FLAGS_RAW_BINARY
-	FLAGS_ENCRYPTED
+	flags_REQUEST = 1 << iota
+	flags_RESPONSE
+	flags_UNDELIVERABLE
+	flags_TAINTED
+	flags_RAW_BINARY
+	flags_ENCRYPTED
 
 	header_VERSION       = 2
 	header_MARKER        = 0xaaaa
 	header_MAX_TOPIC_LEN = 128
-	header_MIN           = 32
+	header_LEN_NO_TS     = 32
+	header_LEN_W_TS      = 52
 )
 
-type Header struct {
-	Version        uint16
-	HeaderLength   uint16
+//	Wire format
+//  --------------------------------------
+//	Preamble         uint16
+//	Version          uint16
+//	HeaderLength     uint16
+//	SequenceNumber   uint32
+//	Flags            uint32
+//	ControlData      uint32
+//	PayloadLength    uint32
+//	TopicLength      uint32
+//	Topic            []byte
+//	ReplyTopicLength uint32
+//	ReplyTopic       []byte
+//	Timestamp1       uint32
+//	Timestamp2       uint32
+//	Timestamp3       uint32
+//	Timestamp4       uint32
+//	Timestamp5       uint32
+//	Postamble        uint16
+
+type MsgType int
+
+const (
+	MsgTypeUnknown MsgType = iota
+	MsgTypeRequest
+	MsgTypeResponse
+)
+
+type PayloadType int
+
+const (
+	PayloadTypeUnknown PayloadType = iota
+	PayloadTypeMsgPack
+	PayloadTypeBinary
+)
+
+// Message represents a message that can be sent or received over the connection.
+type Message struct {
+	Type           MsgType
+	PayloadType    PayloadType
+	Encrypted      bool
+	Undeliverable  bool
 	SequenceNumber uint32
-	Flags          uint32
-	ControlData    uint32
-	PayloadLength  uint32
+	ControlData    uint32 // Either the subscription ID or the client ID
 	Topic          string
 	ReplyTopic     string
+	Timestamps     []time.Time
+	Payload        []byte
 }
 
-type Message struct {
-	Header  *Header
-	Payload []byte
-}
-
-func (h *Header) decodePreamble(buff []byte) error {
-	const headerMagic = uint16(0xaaaa)
-
-	reader := bytes.NewReader(buff)
-	marker := uint16(0)
-
-	// first two bytes are a magic number
-	if err := binary.Read(reader, binary.BigEndian, &marker); err != nil {
-		return err
+// marshal returns the wire format of the message.
+func (m *Message) marshal() ([]byte, error) {
+	if m.Topic == "" {
+		return nil, fmt.Errorf("topic is required")
 	}
 
-	if marker != headerMagic {
-		return fmt.Errorf("invalid header maggic: 0x%02x. Expected: 0x%02x", marker, headerMagic)
-	}
+	var buf bytes.Buffer
+	var err error
 
-	// header_version
-	if err := binary.Read(reader, binary.BigEndian, &h.Version); err != nil {
-		return err
-	}
+	headerLength := header_LEN_W_TS + len(m.Topic) + len(m.ReplyTopic)
 
-	// header_length
-	if err := binary.Read(reader, binary.BigEndian, &h.HeaderLength); err != nil {
-		return err
-	}
+	buf.Grow(int(headerLength) + len(m.Payload))
 
-	return nil
-}
+	writeOrDie(&buf, &err, uint16(header_MARKER))
+	writeOrDie(&buf, &err, uint16(header_VERSION))
+	writeOrDie(&buf, &err, uint16(headerLength))
+	writeOrDie(&buf, &err, m.SequenceNumber)
+	writeOrDie(&buf, &err, m.flagsOut())
+	writeOrDie(&buf, &err, m.ControlData)
+	writeOrDie(&buf, &err, uint32(len(m.Payload)))
+	writeOrDie(&buf, &err, m.Topic)
+	writeOrDie(&buf, &err, m.ReplyTopic)
+	writeOrDie(&buf, &err, uint32(0))
+	writeOrDie(&buf, &err, uint32(0))
+	writeOrDie(&buf, &err, uint32(0))
+	writeOrDie(&buf, &err, uint32(0))
+	writeOrDie(&buf, &err, uint32(0))
+	writeOrDie(&buf, &err, uint16(header_MARKER))
+	writeOrDie(&buf, &err, m.Payload)
 
-func (h *Header) decodePostPreamble(buff []byte) error {
-	reader := bytes.NewReader(buff)
-
-	if err := binary.Read(reader, binary.BigEndian, &h.SequenceNumber); err != nil {
-		return err
-	}
-
-	if err := binary.Read(reader, binary.BigEndian, &h.Flags); err != nil {
-		return err
-	}
-
-	if err := binary.Read(reader, binary.BigEndian, &h.ControlData); err != nil {
-		return err
-	}
-
-	if err := binary.Read(reader, binary.BigEndian, &h.PayloadLength); err != nil {
-		return err
-	}
-
-	// topic
-	topicLength := uint32(0)
-	if err := binary.Read(reader, binary.BigEndian, &topicLength); err != nil {
-		return err
-	}
-	if topicLength > 0 {
-		topic := make([]byte, topicLength)
-		if _, err := reader.Read(topic); err != nil {
-			return err
-		}
-		h.Topic = string(topic)
-	}
-
-	// reply_topic
-	replyTopicLen := uint32(0)
-	if err := binary.Read(reader, binary.BigEndian, &replyTopicLen); err != nil {
-		return err
-	}
-	if replyTopicLen > 0 {
-		replyTopic := make([]byte, replyTopicLen)
-		if _, err := reader.Read(replyTopic); err != nil {
-			return err
-		}
-		h.ReplyTopic = string(replyTopic)
-	}
-
-	// Those 5 timestamps
-	unused := uint32(0)
-	if err := binary.Read(reader, binary.BigEndian, &unused); err != nil {
-		return err
-	}
-	if err := binary.Read(reader, binary.BigEndian, &unused); err != nil {
-		return err
-	}
-	if err := binary.Read(reader, binary.BigEndian, &unused); err != nil {
-		return err
-	}
-	if err := binary.Read(reader, binary.BigEndian, &unused); err != nil {
-		return err
-	}
-	if err := binary.Read(reader, binary.BigEndian, &unused); err != nil {
-		return err
-	}
-
-	magic := uint16(0)
-	if err := binary.Read(reader, binary.BigEndian, &magic); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (h *Header) encode() ([]byte, error) {
-	buf := new(bytes.Buffer)
-
-	if err := binary.Write(buf, binary.BigEndian, uint16(header_MARKER)); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, h.Version); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, h.HeaderLength); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, h.SequenceNumber); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, h.Flags); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, h.ControlData); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, h.PayloadLength); err != nil {
-		return nil, err
-	}
-
-	// read topic length and topic
-	topicLength := uint32(len(h.Topic))
-	if topicLength == 0 {
-		return nil, fmt.Errorf("invalid topic length of zero")
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, topicLength); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, []byte(h.Topic)); err != nil {
-		return nil, err
-	}
-
-	// read the reply topic length and reply topic
-	replyTopicLen := uint32(len(h.ReplyTopic))
-	if err := binary.Write(buf, binary.BigEndian, replyTopicLen); err != nil {
-		return nil, err
-	}
-
-	if replyTopicLen > 0 {
-		if err := binary.Write(buf, binary.BigEndian, []byte(h.ReplyTopic)); err != nil {
-			return nil, err
-		}
-	}
-
-	// TODO: read the timestamps (not recording them right now)
-	zero := 0
-	if err := binary.Write(buf, binary.BigEndian, uint32(zero)); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, uint32(zero)); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, uint32(zero)); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, uint32(zero)); err != nil {
-		return nil, err
-	}
-
-	if err := binary.Write(buf, binary.BigEndian, uint32(zero)); err != nil {
-		return nil, err
-	}
-
-	// read trailing marker
-	if err := binary.Write(buf, binary.BigEndian, uint16(header_MARKER)); err != nil {
+	if err != nil {
 		return nil, err
 	}
 
 	return buf.Bytes(), nil
 }
 
-// MessageListener provides a simple way to get notified when a new Message
-// is read from the bus.
-type MessageListener interface {
-	OnMessage(Message)
+// unmarshal reads a message from an io.Reader.
+func unmarshal(r io.Reader) (Message, error) {
+	var msg Message
+	var err error
+	var preamble, postamble, version, headerSize uint16
+	var flags, payloadLength uint32
+
+	readOrDie(r, &err, &preamble)
+	if preamble != header_MARKER {
+		return Message{}, fmt.Errorf("invalid preamble: %x", preamble)
+	}
+	readOrDie(r, &err, &version)
+	if version != header_VERSION {
+		return Message{}, fmt.Errorf("invalid version: %d", version)
+	}
+	readOrDie(r, &err, &headerSize)
+	readOrDie(r, &err, &msg.SequenceNumber)
+	readOrDie(r, &err, &flags)
+	readOrDie(r, &err, &msg.ControlData)
+	readOrDie(r, &err, &payloadLength)
+	readOrDie(r, &err, &msg.Topic)
+	readOrDie(r, &err, &msg.ReplyTopic)
+	if headerSize == header_LEN_W_TS+uint16(len(msg.Topic))+uint16(len(msg.ReplyTopic)) {
+		var ts [5]uint32
+		readOrDie(r, &err, &ts[0])
+		readOrDie(r, &err, &ts[1])
+		readOrDie(r, &err, &ts[2])
+		readOrDie(r, &err, &ts[3])
+		readOrDie(r, &err, &ts[4])
+	}
+	readOrDie(r, &err, &postamble)
+	if postamble != header_MARKER {
+		return Message{}, fmt.Errorf("invalid postamble: %x", postamble)
+	}
+
+	if err != nil {
+		return Message{}, err
+	}
+
+	msg.Payload = make([]byte, payloadLength)
+	_, err = io.ReadFull(r, msg.Payload)
+	if err != nil {
+		return Message{}, err
+	}
+
+	msg.flagsIn(flags)
+
+	return msg, nil
 }
 
-// MessageListenerFunc is a function that implements the MessageListener
-// interface.  It is useful for creating a listener from a function.
-type MessageListenerFunc func(Message)
+// flagsIn sets the message type and flags based on the flags field.
+func (m *Message) flagsIn(flags uint32) {
+	// Determine the message type
+	switch flags & (flags_REQUEST | flags_RESPONSE) {
+	case flags_REQUEST:
+		m.Type = MsgTypeRequest
+	case flags_RESPONSE:
+		m.Type = MsgTypeResponse
+	}
 
-func (f MessageListenerFunc) OnMessage(m Message) {
-	f(m)
+	// Determine the payload type
+	if flags&flags_RAW_BINARY != 0 {
+		m.PayloadType = PayloadTypeBinary
+	}
+
+	if flags&flags_ENCRYPTED != 0 {
+		m.Encrypted = true
+	}
+
+	if flags&flags_UNDELIVERABLE != 0 {
+		m.Undeliverable = true
+	}
 }
 
-// CancelListenerFunc removes the listener it's associated with and cancels any
-// future events sent to that listener.
-//
-// A CancelListenerFunc is idempotent:  after the first invocation, calling this
-// closure will have no effect.
-type CancelListenerFunc func()
+// flagsOut returns the flags field based on the message type and flags.
+func (m *Message) flagsOut() uint32 {
+	var flags uint32
+	switch m.Type {
+	case MsgTypeRequest:
+		flags |= flags_REQUEST
+	case MsgTypeResponse:
+		flags |= flags_RESPONSE
+	}
+
+	if m.Encrypted {
+		flags |= flags_ENCRYPTED
+	}
+
+	if m.Undeliverable {
+		flags |= flags_UNDELIVERABLE
+	}
+
+	if m.PayloadType == PayloadTypeBinary {
+		flags |= flags_RAW_BINARY
+	}
+	return flags
+}
+
+// readOrDie reads a value of type T from the reader and sets the error if any.
+// If an error has already been set, the function returns immediately.
+// This allows for a more concise error handling pattern.
+func readOrDie[T uint16 | uint32 | string](r io.Reader, err *error, data *T) {
+	if *err != nil {
+		return
+	}
+
+	switch v := any(data).(type) {
+	case *uint16, *uint32:
+		*err = binary.Read(r, binary.BigEndian, v)
+	case *string:
+		var length uint32
+		*err = binary.Read(r, binary.BigEndian, &length)
+		if *err != nil {
+			return
+		}
+
+		buf := make([]byte, length)
+		_, *err = io.ReadFull(r, buf)
+		if *err == nil {
+			*v = string(buf)
+		}
+	}
+}
+
+// writeOrDie writes a value of type T to the writer and sets the error if any.
+// If an error has already been set, the function returns immediately.
+// This allows for a more concise error handling pattern.
+func writeOrDie[T uint16 | uint32 | string | []byte](w io.Writer, err *error, data T) {
+	if *err != nil {
+		return
+	}
+
+	switch v := any(data).(type) {
+	case uint16:
+		fmt.Printf("writing uint16: %d\n", v)
+		*err = binary.Write(w, binary.BigEndian, v)
+	case uint32:
+		fmt.Printf("writing uint32: %d\n", v)
+		*err = binary.Write(w, binary.BigEndian, v)
+	case string:
+		fmt.Printf("writing string: %d:%s\n", len(v), v)
+		*err = binary.Write(w, binary.BigEndian, uint32(len(v)))
+		if *err == nil {
+			_, *err = w.Write([]byte(v))
+		}
+	case []byte:
+		fmt.Printf("writing []byte: %d\n", len(v))
+		_, *err = io.Copy(w, bytes.NewReader(v))
+	}
+}

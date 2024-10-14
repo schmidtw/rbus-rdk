@@ -5,84 +5,71 @@ package rtmessage
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/xmidt-org/eventor"
 )
 
-var (
-	ErrInvalidState = errors.New("invalid state")
-	ErrInvalidInput = errors.New("invalid input")
-)
-
-type SubscriptionIDGenerator struct {
-	counter uint32
-}
-
-func (s *SubscriptionIDGenerator) getNextSubscriptionID() int {
-	return int(atomic.AddUint32(&s.counter, 1))
-}
-
-type ReadState int
-
-const (
-	ReadStateReadHeaderPreamble = iota
-	ReadStateReadHeader
-	ReadStateReadPayload
-)
-
-type MessageCallback func(*Header, []byte)
-
+// Connection represents a connection to the server.
 type Connection struct {
-	url             *url.URL
-	con             net.Conn
-	cancel          context.CancelFunc
-	m               sync.Mutex
-	appName         string
-	inboxName       string
-	generator       SubscriptionIDGenerator
-	state           ReadState
-	messageHandlers map[int]MessageCallback
-}
-
-type subscriptionRequest struct {
-	Topic   string `json:"topic"`
-	Add     int    `json:"add"`
-	RouteID int    `json:"route_id"`
+	url           *url.URL
+	name          string
+	id            int
+	cancel        context.CancelFunc
+	conn          net.Conn
+	m             sync.Mutex
+	readTimeout   time.Duration
+	writeTimeout  time.Duration
+	subscriptions map[string]struct{}
+	msgListeners  eventor.Eventor[MessageListener]
+	errListeners  eventor.Eventor[ReadErrorListener]
+	routeID       uint32 // only access via atomic operations
 }
 
 // New creates a new connection or returns an error.
-func New(rawURL string, appName string) (*Connection, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, err
+func New(rawURL string, name string, id int, opts ...Option) (*Connection, error) {
+	c := Connection{
+		name: name,
+		id:   id,
 	}
 
-	switch u.Scheme {
-	case "unix", "tcp":
-	default:
-		return nil, fmt.Errorf("%w: unsupported URL scheme", ErrInvalidInput)
+	required := []Option{
+		withRawURL(rawURL),
 	}
 
-	return &Connection{
-		url:             u,
-		appName:         appName,
-		state:           ReadStateReadHeaderPreamble,
-		inboxName:       fmt.Sprintf("%s.INBOX.%d", appName, os.Getpid()),
-		messageHandlers: make(map[int]MessageCallback),
-	}, nil
+	opts = append(opts, required...)
+
+	for _, opt := range opts {
+		err := opt.apply(&c)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &c, nil
+}
+
+// AddReadErrorListener adds a listener for read errors.
+func (c *Connection) AddReadErrorListener(listener ReadErrorListener) CancelListenerFunc {
+	return c.errListeners.Add(listener)
+}
+
+// AddMessageListener adds a listener for messages.
+func (c *Connection) AddMessageListener(listener MessageListener) CancelListenerFunc {
+	return c.msgListeners.Add(listener)
 }
 
 // Connect establishes a connection to the server.
-func (c *Connection) Connect(inboxHandler MessageCallback) error {
+func (c *Connection) Connect() error {
 	c.m.Lock()
 	defer c.m.Unlock()
 
-	if c.con != nil {
+	if c.conn != nil {
 		return nil
 	}
 
@@ -101,35 +88,24 @@ func (c *Connection) Connect(inboxHandler MessageCallback) error {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	c.con = con
+	c.conn = con
 	c.cancel = cancel
-
-	if inboxHandler != nil {
-		c.AddListener(ctx, c.inboxName, inboxHandler)
-	}
 
 	go c.readLoop(ctx)
 
-	return nil
-}
-
-func (c *Connection) AddListener(ctx context.Context, expression string, callback MessageCallback) error {
-	req := subscriptionRequest{
-		Topic:   c.inboxName,
-		Add:     1,
-		RouteID: c.generator.getNextSubscriptionID(),
+	// Subscribe to the inbox
+	list := []string{fmt.Sprintf("%s.INBOX.%d", c.name, c.id)}
+	for topic, _ := range c.subscriptions {
+		list = append(list, topic)
 	}
 
-	jsonData, err := json.Marshal(req)
-	if err != nil {
-		return err
+	// Subscribe to everything in the list.
+	for _, topic := range list {
+		err := c.subscribe(ctx, topic)
+		if err != nil {
+			return err
+		}
 	}
-
-	if err := c.Send(ctx, jsonData, "_RTROUTED.INBOX.SUBSCRIBE"); err != nil {
-		return err
-	}
-
-	c.messageHandlers[req.RouteID] = callback
 
 	return nil
 }
@@ -139,20 +115,122 @@ func (c *Connection) Disconnect() error {
 	c.m.Lock()
 	defer c.m.Unlock()
 
-	if c.con == nil {
+	if c.conn == nil {
 		return nil
 	}
 
 	c.cancel()
-	err := c.con.Close()
-	c.con = nil
+	err := c.conn.Close()
+	c.conn = nil
 	c.cancel = nil
 
 	return err
 }
 
-func sendAll(ctx context.Context, conn net.Conn, buff []byte) error {
-	total := len(buff)
+// Send sends a message to the server.  If the context is canceled, the function
+// will return immediately with the context error.
+func (c *Connection) Send(ctx context.Context, msg Message) error {
+	c.m.Lock()
+	defer c.m.Unlock()
+	return c.send(ctx, msg)
+}
+
+// Subscribe subscribes to a topic.
+func (c *Connection) Subscribe(ctx context.Context, expression string) error {
+	c.m.Lock()
+	defer c.m.Unlock()
+	c.subscriptions[expression] = struct{}{}
+	return c.subscribe(ctx, expression)
+}
+
+func sooner(timeout time.Duration, ctx context.Context) time.Time {
+	deadline := time.Time{}
+	if when, valid := ctx.Deadline(); valid {
+		deadline = when
+	}
+
+	if timeout > 0 {
+		when := time.Now().Add(timeout)
+		if !deadline.IsZero() && deadline.After(when) {
+			return when
+		}
+	}
+
+	return deadline
+}
+
+// setReadDeadline sets the read deadline on the connection.
+func (c *Connection) setReadDeadline(ctx context.Context) error {
+	if c.conn == nil {
+		return ErrInvalidState
+	}
+
+	when := sooner(c.readTimeout, ctx)
+	if !when.IsZero() {
+		return c.conn.SetReadDeadline(when)
+	}
+	return nil
+}
+
+// setWriteDeadline sets the write deadline on the connection.
+func (c *Connection) setWriteDeadline(ctx context.Context) error {
+	if c.conn == nil {
+		return ErrInvalidState
+	}
+
+	when := sooner(c.readTimeout, ctx)
+	if !when.IsZero() {
+		return c.conn.SetWriteDeadline(when)
+	}
+	return nil
+}
+
+// readLoop reads messages from the server and sends events to registered listeners.
+func (c *Connection) readLoop(ctx context.Context) {
+	defer func() {
+		_ = c.Disconnect()
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			err := c.setReadDeadline(ctx)
+			if err != nil {
+				c.errListeners.Visit(func(listener ReadErrorListener) {
+					listener.OnReadError(err)
+				})
+				return
+			}
+
+			msg, err := unmarshal(c.conn)
+			if err != nil {
+				c.errListeners.Visit(func(listener ReadErrorListener) {
+					listener.OnReadError(err)
+				})
+				return
+			}
+
+			c.msgListeners.Visit(func(listener MessageListener) {
+				listener.OnMessage(msg)
+			})
+		}
+	}
+}
+
+// send sends a message to the server.
+func (c *Connection) send(ctx context.Context, msg Message) error {
+	if c.conn == nil {
+		return ErrInvalidState
+	}
+
+	b, err := msg.marshal()
+	if err != nil {
+		return err
+	}
+
+	total := len(b)
 	sent := 0
 
 	for sent < total {
@@ -160,7 +238,12 @@ func sendAll(ctx context.Context, conn net.Conn, buff []byte) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			n, err := conn.Write(buff[sent:])
+			err := c.setWriteDeadline(ctx)
+			if err != nil {
+				return err
+			}
+
+			n, err := c.conn.Write(b[sent:])
 			if err != nil {
 				return err
 			}
@@ -171,147 +254,32 @@ func sendAll(ctx context.Context, conn net.Conn, buff []byte) error {
 	return nil
 }
 
-func (c *Connection) makeEncodedHeader(payload []byte, topic string, replyTopic string, isRequest bool) ([]byte, error) {
-	topicLength := len(topic)
-	replyTopicLength := len(replyTopic)
-	sizeWithoutStringsInBytes := 32
-	sizeWithoutStringsInBytes += 20 // 4 time_t fields
-
-	header := Header{
-		Version:        2,
-		HeaderLength:   uint16(sizeWithoutStringsInBytes + topicLength + replyTopicLength),
-		SequenceNumber: uint32(c.generator.getNextSubscriptionID()),
-		Flags:          0,
-		ControlData:    0,
-		PayloadLength:  uint32(len(payload)),
-		Topic:          topic,
-		ReplyTopic:     replyTopic,
-	}
-
-	if isRequest {
-		header.Flags |= 0x01
-	}
-
-	encodedHeader, err := header.encode()
-	if err != nil {
-		return nil, err
-	}
-
-	return encodedHeader, nil
+// nextRouteID returns the next route ID.
+func (c *Connection) nextRouteID() int {
+	return int(atomic.AddUint32(&c.routeID, 1))
 }
 
-// Send sends a message to the server.  If the context is canceled, the function
-// will return immediately with the context error.
-func (c *Connection) Send(ctx context.Context, payload []byte, topic string) error {
-	encodedHeader, err := c.makeEncodedHeader(payload, topic, "", false)
+// subscribe subscribes to a topic.
+func (c *Connection) subscribe(ctx context.Context, expression string) error {
+	req := struct {
+		Topic   string `json:"topic"`
+		Add     int    `json:"add"`
+		RouteID int    `json:"route_id"`
+	}{
+		Topic:   expression,
+		Add:     1,
+		RouteID: c.nextRouteID(),
+	}
+
+	jsonData, err := json.Marshal(req)
 	if err != nil {
 		return err
 	}
 
-	return c.sendWithHeader(ctx, encodedHeader, payload)
-}
-
-func (c *Connection) SendRequest(ctx context.Context, payload []byte, topic string) error {
-	encodedHeader, err := c.makeEncodedHeader(payload, topic, c.inboxName, true)
-	if err != nil {
-		return err
+	m := Message{
+		Topic:   "_RTROUTED.INBOX.SUBSCRIBE",
+		Payload: jsonData,
 	}
 
-	return c.sendWithHeader(ctx, encodedHeader, payload)
-}
-
-func (c *Connection) sendWithHeader(ctx context.Context, header []byte, payload []byte) error {
-	if c.con == nil {
-		return ErrInvalidState
-	}
-
-	if err := sendAll(ctx, c.con, header); err != nil {
-		return err
-	}
-
-	if err := sendAll(ctx, c.con, payload); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (c *Connection) readUntil(ctx context.Context, buf []byte) error {
-	total := len(buf)
-	read := 0
-
-	for read < total {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			n, err := c.con.Read(buf[read:])
-			if err != nil {
-				return err
-			}
-			read += n
-		}
-	}
-
-	return nil
-}
-
-// readLoop reads messages from the server and sends events to registered listeners.
-func (c *Connection) readLoop(ctx context.Context) {
-	var header *Header
-
-	const headerPreambleLength = uint16(6)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			switch c.state {
-			case ReadStateReadHeaderPreamble:
-				header = &Header{}
-				buff := make([]byte, headerPreambleLength)
-
-				if err := c.readUntil(ctx, buff); err != nil {
-					fmt.Printf("Failed to read header preamble: %v\n", err)
-					return
-				}
-
-				if err := header.decodePreamble(buff); err != nil {
-					fmt.Printf("Failed to decode header preamble: %v\n", err)
-					return
-				}
-
-				c.state = ReadStateReadHeader
-
-			case ReadStateReadHeader:
-				buff := make([]byte, header.HeaderLength-headerPreambleLength)
-
-				if err := c.readUntil(ctx, buff); err != nil {
-					fmt.Printf("Failed to read header: %v\n", err)
-					return
-				}
-
-				if err := header.decodePostPreamble(buff); err != nil {
-					fmt.Printf("Failed to decode header: %v\n", err)
-					return
-				}
-
-				c.state = ReadStateReadPayload
-
-			case ReadStateReadPayload:
-				buff := make([]byte, header.PayloadLength)
-				if err := c.readUntil(ctx, buff); err != nil {
-					fmt.Printf("Failed to read payload: %v\n", err)
-					return
-				}
-
-				if handler, ok := c.messageHandlers[int(header.ControlData)]; ok {
-					handler(header, buff)
-				}
-
-				c.state = ReadStateReadHeaderPreamble
-			}
-		}
-	}
+	return c.send(ctx, m)
 }
