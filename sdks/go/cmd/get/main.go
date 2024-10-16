@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -23,7 +22,7 @@ func main() {
 		panic(fmt.Sprintf("Failed to open rbus connection. %s", err.Error()))
 	}
 
-	v, err := h.Get(context.Background(), "Device.SampleProvider.AllTypes.Int16Data")
+	v, err := h.Get("Device.SampleProvider.AllTypes.Int16Data")
 	if err != nil {
 		panic(fmt.Sprintf("Failed to get value. %s", err.Error()))
 	}
